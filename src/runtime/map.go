@@ -61,6 +61,8 @@ import (
 )
 
 const (
+	// 最多保存8个元素。在这里写死了。
+	//
 	// Maximum number of key/elem pairs a bucket can hold.
 	bucketCntBits = 3
 	bucketCnt     = 1 << bucketCntBits
@@ -77,11 +79,16 @@ const (
 	maxKeySize  = 128
 	maxElemSize = 128
 
+	// 如何获取数据的地址。这块很牛逼，通过偏移直接去读数据的首地址。
+	// 真的是通过指针去操作。很像c语言之前语言，直接操作内存地址。
+	//
 	// data offset should be the size of the bmap struct, but needs to be
 	// aligned correctly. For amd64p32 this means 64-bit alignment
 	// even though pointers are 32 bit.
 	dataOffset = unsafe.Offsetof(struct {
 		b bmap
+
+		// v只是一个占位符。主要是为了计算b的内存占用空间，v所在的地址相当于是数据的首地址。
 		v int64
 	}{}.v)
 
@@ -121,6 +128,7 @@ type hmap struct {
 	noverflow uint16 // approximate number of overflow buckets; see incrnoverflow for details
 	hash0     uint32 // hash seed
 
+	// TODO(zy): bucket是数组形式保存在这里。
 	buckets    unsafe.Pointer // array of 2^B Buckets. may be nil if count==0.
 	oldbuckets unsafe.Pointer // previous bucket array of half the size, non-nil only when growing
 	nevacuate  uintptr        // progress counter for evacuation (buckets less than this have been evacuated)
@@ -405,14 +413,30 @@ func mapaccess1(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
 		if t.hashMightPanic() {
 			t.hasher(key, 0) // see issue 23734
 		}
+		// Tips(zy): 所有的空指针都可以定义成这个 &zeroVal[0]
 		return unsafe.Pointer(&zeroVal[0])
 	}
+
+	// 常常看到的并发读写map的panic。
 	if h.flags&hashWriting != 0 {
 		throw("concurrent map read and map write")
 	}
+
+	// 获取指定的bucket
 	hash := t.hasher(key, uintptr(h.hash0))
 	m := bucketMask(h.B)
+
+	// h.buckets是一段数组，即连续的内存块。
+	// 访问指定bucket时，实际上也是就是跟map的实现有关系。
+	// map的理论实现就是：1、申请一块连续的内存空间。2、在这个内存中的所有的元素的大小一致。
+	// O(1)的访问时间是：
+	// 1、通过hash_func获取到存放的偏移位。
+	// 2、从连续内存的起始位置+偏移位，即可访问到具体的元素。
+	// 3、（冲突）开放地址法或者拉链法。这里使用的是拉链法。
 	b := (*bmap)(add(h.buckets, (hash&m)*uintptr(t.bucketsize)))
+
+	// 如果存在旧的buckets的话，数据可能存放在oldbuckets中。
+	// 下面也是同样的访问方式。（暂时跳过）
 	if c := h.oldbuckets; c != nil {
 		if !h.sameSizeGrow() {
 			// There used to be half as many buckets; mask down one more power of two.
@@ -423,29 +447,64 @@ func mapaccess1(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
 			b = oldb
 		}
 	}
+
+	// 计算获取到top。top是在bucket里面定位到元素的。
 	top := tophash(hash)
 bucketloop:
 	for ; b != nil; b = b.overflow(t) {
+
+		// 开始遍历bucket中的每个元素。
+		// 基本逻辑是：
+		// 1、先使用hash，算出来top。通过top去查找8个tophash的状态或者位置。
+		// 2、遍历8个tophash，看当前元素状态是否为top，或者元素已经被移动了。
+		// 3、如果通过hashtop找到元素，则从dataOffset中获取到key。
+		// 4、如果找到key，那么从对应的偏移位中拿到对应的value element。
+		//
+		// 参考：https://segmentfault.com/a/1190000023879178
 		for i := uintptr(0); i < bucketCnt; i++ {
+
+			// tophash[i]对应的value，是top。
+
+			// 如果没有找到对应的元素。
 			if b.tophash[i] != top {
+				// 已经遍历完了，还是没有找到。
 				if b.tophash[i] == emptyRest {
 					break bucketloop
 				}
 				continue
 			}
+
+			// 如果跳到这里了，那就表示i已经找到了对应的元素。
+			// top是key；k是找到对应的数据元素。
 			k := add(unsafe.Pointer(b), dataOffset+i*uintptr(t.keysize))
+
+			// 如果是指针的话，取出指针指向地址的内存数据。
 			if t.indirectkey() {
 				k = *((*unsafe.Pointer)(k))
 			}
+
 			if t.key.equal(key, k) {
+				// e是元素所在的地址。
+				// dataOffset为数据元素的偏移位。
+				// 数据元素的格式是：
+				// 1、8个key的slot。
+				// 2、n个elem的slot。
+				//
+				// 元素所在的地址就是：dataOffset的地址，加上8个key slot的偏移，加上i个元素的slot。
 				e := add(unsafe.Pointer(b), dataOffset+bucketCnt*uintptr(t.keysize)+i*uintptr(t.elemsize))
+
+				// 如果是指针的话，那么解析地址。
 				if t.indirectelem() {
 					e = *((*unsafe.Pointer)(e))
 				}
 				return e
 			}
+
+			// 由于使用了拉链法。
+			// 如果当前bucket没有找到的话，那么就去找下一个bucket。
 		}
-	}
+	} // end bucketloop
+
 	return unsafe.Pointer(&zeroVal[0])
 }
 
@@ -990,6 +1049,7 @@ func mapclear(t *maptype, h *hmap) {
 		throw("concurrent map writes")
 	}
 
+	// 标识正在读。异或操作xor：所有相同的位为0，不相同的位为1。
 	h.flags ^= hashWriting
 
 	h.flags &^= sameSizeGrow

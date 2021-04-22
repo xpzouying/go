@@ -4071,8 +4071,8 @@ func newproc1(fn *funcval, argp unsafe.Pointer, narg int32, callergp *g, callerp
 		throw("newproc: function arguments too large for new goroutine")
 	}
 
-	_p_ := _g_.m.p.ptr()
-	newg := gfget(_p_)
+	_p_ := _g_.m.p.ptr() // 当前正在运行线程上面的p
+	newg := gfget(_p_)   // 获取一个g。这里有可能会创建，也有可能是复用。
 	if newg == nil {
 		newg = malg(_StackMin)
 		casgstatus(newg, _Gidle, _Gdead)
@@ -4088,15 +4088,19 @@ func newproc1(fn *funcval, argp unsafe.Pointer, narg int32, callergp *g, callerp
 
 	totalSize := 4*sys.PtrSize + uintptr(siz) + sys.MinFrameSize // extra space in case of reads slightly beyond frame
 	totalSize += -totalSize & (sys.StackAlign - 1)               // align to StackAlign
-	sp := newg.stack.hi - totalSize
+	sp := newg.stack.hi - totalSize                              // 调整sp指针，即为当前栈的大小空间
 	spArg := sp
-	if usesLR {
-		// caller's LR
-		*(*uintptr)(unsafe.Pointer(sp)) = 0
-		prepGoExitFrame(sp)
-		spArg += sys.MinFrameSize
-	}
+
+	// 忽略ARM架构
+	// if usesLR {
+	// 	// caller's LR
+	// 	*(*uintptr)(unsafe.Pointer(sp)) = 0
+	// 	prepGoExitFrame(sp)
+	// 	spArg += sys.MinFrameSize
+	// }
+
 	if narg > 0 {
+		// 使用memmove将函数参数传递过来。
 		memmove(unsafe.Pointer(spArg), argp, uintptr(narg))
 		// This is a stack-to-stack copy. If write barriers
 		// are enabled and the source stack is grey (the
